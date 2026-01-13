@@ -40,9 +40,6 @@ LiBox consists of three main components:
 git clone https://github.com/yourusername/libox.git
 cd libox
 
-# Build benchmark (creates test/benchmark)
-make
-
 # Build optimization tool
 make all
 
