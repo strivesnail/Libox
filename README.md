@@ -14,7 +14,7 @@ LiBox is a high-performance learned index data structure optimized for modern mu
 ## Requirements
 
 - **CPU**: x86-64 processor with AVX-512 support
-- **Compiler**: GCC 7.0+ with C++17 support
+- **Compiler**: GCC 7.0+ with C++20 support
 - **Dependencies**: OpenMP
 
 ```bash
@@ -56,9 +56,10 @@ Use the partition optimization tool to analyze your dataset and generate an opti
 
 ```bash
 # Analyze your dataset and generate configuration
-./test/partition_optimization \
-/path/to/your/dataset.csv \
-generated_config.csv
+./test/partition_optimization /path/to/your/dataset.csv generated_config.csv
+
+# With optional max_box_in_segment parameter (default: 50000)
+./test/partition_optimization /path/to/your/dataset.csv generated_config.csv 50000
 ```
 
 Or use the provided sample configuration for quick testing.
@@ -221,7 +222,7 @@ The `sample/` directory contains example files for quick testing:
 1. **Analyze and Generate Configuration**:
 
    ```bash
-   ./test/partition_optimization --input_file=your_data.csv --output_config=optimized_segment.csv
+   ./test/partition_optimization your_data.csv optimized_segment.csv
    ```
 
 2. **Run Benchmark**:
