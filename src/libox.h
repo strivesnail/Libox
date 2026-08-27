@@ -881,7 +881,7 @@ public:
         if (!enter()) {
             return {DeleteStatus::SPLIT, false};
         }
-        if (key < lower_bound || key > upper_bound) {
+        if (key < lower_bound || key >= upper_bound) {
             leave();
             return {DeleteStatus::OUT_OF_RANGE, false};
         }
@@ -1135,7 +1135,7 @@ public:
                     #ifndef NDEBUG
                     // print the bounds of the segments before and after the split
                     cout << "Before split: " << endl;
-                    for (int i = seg_index; i < seg_index + 10; i++) {
+                    for (int i = seg_index; i < min(seg_index + 10, segments.size()); i++) {
                         cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
                     }
                     #endif
@@ -1146,7 +1146,7 @@ public:
                     #ifndef NDEBUG
                     // print 10 segments from seg_index to seg_index + 10
                     cout << "After split: " << endl;
-                    for (int i = seg_index; i < seg_index + 10; i++) {
+                    for (int i = seg_index; i < min(seg_index + 10, segments.size()); i++) {
                         cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
                     }
                     #endif
@@ -1167,11 +1167,19 @@ public:
             {
                 std::lock_guard<std::mutex> lock(print_mutex_);
                 cout << "Out-of-range: segidx=" << seg_index << ", total_segments="
-                     << segments.size() << ", key=" << key
-                     << ", prevSegBounds=(" << segments[seg_index - 1]->getLowerBound() << ", " << segments[seg_index - 1]->getUpperBound() << ")"
-                     << ", currSegBounds=(" << segments[seg_index]->getLowerBound() << ", " << segments[seg_index]->getUpperBound() << ")"
-                     << ", nextSegBounds=(" << segments[seg_index + 1]->getLowerBound() << ", " << segments[seg_index + 1]->getUpperBound() << ")"
-                     << endl;
+                     << segments.size() << ", key=" << key;
+
+                if (seg_index - 1 >= 0) {
+                    cout << ", prevSegBounds=(" << segments[seg_index - 1]->getLowerBound() << ", " << segments[seg_index - 1]->getUpperBound() << ")";
+                }
+
+                cout << ", currSegBounds=(" << segments[seg_index]->getLowerBound() << ", " << segments[seg_index]->getUpperBound() << ")";
+
+                if (seg_index + 1 < segments.size()) {
+                    cout << ", nextSegBounds=(" << segments[seg_index + 1]->getLowerBound() << ", " << segments[seg_index + 1]->getUpperBound() << ")";
+                }
+                cout << endl;
+       
             }
             throw std::runtime_error("Unexpected OUT_OF_RANGE status in insertKeyValue");
         }
