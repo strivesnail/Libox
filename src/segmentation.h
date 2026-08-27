@@ -6,17 +6,26 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "libox_utils.h"
-using namespace liboxns;
+using namespace std;
 
-extern size_t MAX_KEYS_IN_SEGMENT;
+namespace liboxns {
+static const double BOX_CAPACITY = 64.0;
 
-namespace seg {
 template <typename KeyType>
-struct keySegment {
+struct StructSegment {
+    KeyType startIndex;
+    KeyType endIndex;
+    KeyType seg_lower;
+    KeyType seg_upper;
+    KeyType box_range;
+};
+
+template <typename KeyType>
+struct KeySegment {
     size_t start_idx;
     KeyType start_key;
     size_t end_idx; // exclusive
@@ -27,7 +36,7 @@ struct keySegment {
     size_t cum_underflow = 0;
     size_t cum_overflow = 0;
 
-    keySegment(const size_t start_i, KeyType start_k, KeyType window) {
+    KeySegment(const size_t start_i, KeyType start_k, KeyType window) {
         start_idx = start_i;
         end_idx = start_i;
         start_key = start_k;
@@ -35,7 +44,7 @@ struct keySegment {
         window_size = window;
     }
 
-    void expand_to(const keySegment<KeyType>& seg) {
+    void expand_to(const KeySegment<KeyType>& seg) {
         end_idx = seg.end_idx;
         end_key = seg.end_key;
         cum_keys = seg.cum_keys;
@@ -43,9 +52,11 @@ struct keySegment {
         cum_overflow = seg.cum_overflow;
     }
 };
-} // namespace seg
+} // namespace liboxns
 
-using namespace seg;
+extern size_t MAX_KEYS_IN_SEGMENT;
+
+namespace liboxns {
 
 template <typename KeyType>
 size_t find_lower(const std::vector<KeyType>& data,
@@ -67,18 +78,21 @@ size_t find_lower(const std::vector<KeyType>& data,
 // over/underflow ratios are under the thresholds. Looks ahead at most max_look_ahead when the
 // thresholds are not met in an attempt to meet them.
 template <typename KeyType>
-keySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
+KeySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
                              const size_t start_idx,
                              const KeyType start_key,
                              const KeyType window_size,
                              const double overflow_threshold,
                              const double underflow_threshold,
                              const size_t max_look_ahead) {
-    keySegment<KeyType> seg(start_idx, start_key, window_size);
-    keySegment<KeyType> valid_seg(start_idx, start_key, window_size);
+    KeySegment<KeyType> seg(start_idx, start_key, window_size);
+    KeySegment<KeyType> valid_seg(start_idx, start_key, window_size);
 #ifndef NDEBUG
     if (data[start_idx] < start_key || (start_idx != 0 && data[start_idx - 1] >= start_key)) {
-        std::cout << "uh oh\n"; // debug
+        throw std::runtime_error(
+            "makeSegment: start_idx is not the lower bound of start_key (start_idx=" +
+            std::to_string(start_idx) + ", start_key=" + std::to_string(start_key) +
+            ", data[start_idx]=" + std::to_string(data[start_idx]) + ")");
     }
 #endif
 
@@ -95,7 +109,10 @@ keySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
             std::lower_bound(seg.end_idx + data.begin(), data.end(), new_end_key) - data.begin();
 
         if (new_end_idx < seg.end_idx + BOX_CAPACITY * 2 && new_end_idx != test_new_end_idx) {
-            std::cout << "uhhhhhhhhhh\n";
+            throw std::runtime_error(
+                "makeSegment: find_lower disagrees with lower_bound (find_lower=" +
+                std::to_string(new_end_idx) + ", lower_bound=" + std::to_string(test_new_end_idx) +
+                ", new_end_key=" + std::to_string(new_end_key) + ")");
         }
 #endif
 
@@ -135,18 +152,18 @@ keySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
 }
 
 template <typename KeyType>
-keySegment<KeyType> findBestSegment(const std::vector<KeyType>& data,
+KeySegment<KeyType> findBestSegment(const std::vector<KeyType>& data,
                                  const size_t start_idx,
                                  const KeyType start_key,
                                  const std::vector<KeyType>& window_candidates,
                                  const double overflow_threshold,
                                  const double underflow_threshold,
                                  const size_t max_look_ahead) {
-    keySegment<KeyType> best_seg(start_idx, start_key, 0);
+    KeySegment<KeyType> best_seg(start_idx, start_key, 0);
     size_t max_keys = 0;
 
     for (auto& window_size : window_candidates) {
-        keySegment<KeyType> seg = makeSegment(data,
+        KeySegment<KeyType> seg = makeSegment(data,
                                            start_idx,
                                            start_key,
                                            window_size,
@@ -161,7 +178,9 @@ keySegment<KeyType> findBestSegment(const std::vector<KeyType>& data,
     }
 #ifndef NDEBUG
     if (best_seg.cum_keys < BOX_CAPACITY) {
-        std::cout << "not good guys\n";
+        throw std::runtime_error(
+            "findBestSegment: best segment is smaller than BOX_CAPACITY; the \"worst\" segment should have min 64 keys (cum_keys=" +
+            std::to_string(best_seg.cum_keys) + ")");
     }
 #endif
     return best_seg;
@@ -212,9 +231,9 @@ long long wind_cand_idx_sum = 0;
 #endif
 
 template <typename KeyType>
-std::vector<StructSegment<KeyType>> toStructSegment(const std::vector<keySegment<KeyType>>& my_segs) {
+std::vector<StructSegment<KeyType>> toStructSegment(const std::vector<KeySegment<KeyType>>& my_segs) {
     std::vector<StructSegment<KeyType>> segs;
-    for (const keySegment<KeyType>& my_seg : my_segs) {
+    for (const KeySegment<KeyType>& my_seg : my_segs) {
         StructSegment<KeyType> seg;
         seg.seg_lower = my_seg.start_key;
         seg.seg_upper = my_seg.end_key;
@@ -225,20 +244,20 @@ std::vector<StructSegment<KeyType>> toStructSegment(const std::vector<keySegment
 }
 
 template <typename KeyType>
-std::vector<keySegment<KeyType>> calculateSegments(const std::vector<KeyType>& data,
+std::vector<KeySegment<KeyType>> calculateSegments(const std::vector<KeyType>& data,
                                                 const double overflow_threshold,
                                                 const double underflow_threshold,
                                                 const size_t max_look_ahead,
                                                 const KeyType newseg_lower,
                                                 const KeyType newseg_upper) {
-    std::vector<keySegment<KeyType>> segments;
+    std::vector<KeySegment<KeyType>> segments;
     size_t cur_idx = 0;
     KeyType cur_key = newseg_lower <= data[0] ? newseg_lower : data[0];
     while (cur_idx < data.size() && cur_key <= data.back() + 1) {
         if (data.size() - cur_idx < (1 - underflow_threshold) * BOX_CAPACITY) {
             // the remaining data cannot be made into a valid box, so we forcibly create an
             // underflowing segment
-            keySegment<KeyType> seg(cur_idx, cur_key, data.back() - cur_key);
+            KeySegment<KeyType> seg(cur_idx, cur_key, data.back() - cur_key);
             seg.end_idx = data.size();
             seg.end_key = data.back() + 1;
             segments.push_back(seg);
@@ -246,7 +265,7 @@ std::vector<keySegment<KeyType>> calculateSegments(const std::vector<KeyType>& d
         }
 
         std::vector<KeyType> window_candidates = getWindowCandidates(data, cur_idx, cur_key);
-        keySegment<KeyType> seg = findBestSegment(data,
+        KeySegment<KeyType> seg = findBestSegment(data,
                                                cur_idx,
                                                cur_key,
                                                window_candidates,
@@ -257,60 +276,22 @@ std::vector<keySegment<KeyType>> calculateSegments(const std::vector<KeyType>& d
         cur_key = seg.end_key;
 
 #ifndef NDEBUG
-        // debug
-        int win_idx = std::lower_bound(window_candidates.begin(),
-                                       window_candidates.end(),
-                                       seg.window_size) -
-                      window_candidates.begin();
-        wind_cand_idx_sum += win_idx;
-        // end debug
-
         if (cur_idx < data.size() && (data[cur_idx] < cur_key || data[cur_idx - 1] >= cur_key)) {
-            std::cout << "also oh no"; // debug
+            throw std::runtime_error(
+                "calculateSegments: next start is not the lower bound of cur_key (cur_idx=" +
+                std::to_string(cur_idx) + ", cur_key=" + std::to_string(cur_key) +
+                ", data[cur_idx]=" + std::to_string(data[cur_idx]) + ")");
         }
 #endif
 
         segments.push_back(seg);
     }
 
-    keySegment<KeyType>& last_seg = segments.back();
+    KeySegment<KeyType>& last_seg = segments.back();
     if (newseg_upper > last_seg.end_key) last_seg.end_key = newseg_upper;
 
     return segments;
 }
+} // namespace liboxns
 
-template <typename KeyType>
-bool validateSegments(const std::vector<KeyType>& data,
-                      const std::vector<keySegment<KeyType>>& my_segs) {
-    std::vector<StructSegment<KeyType>> segs = toStructSegment(my_segs);
-
-    KeyType start_key = data[0];
-    KeyType end_key = data[0];
-    size_t total_keys = 0;
-    for (int i = 0; i < segs.size(); i++) {
-        const StructSegment<KeyType>& seg = segs[i];
-        if (seg.seg_lower != end_key) {
-            return false;
-        }
-        start_key = end_key;
-        end_key = seg.seg_upper;
-        if (computeUnderflowRatioAccurate(data, seg) > 0.5 ||
-            computeOverflowRatioAccurate(data, seg) > 0.1) {
-            return false;
-        }
-
-        auto start_it = std::lower_bound(data.begin(), data.end(), start_key);
-        int num_keys = countKeysInInterval(data,
-                                           start_it,
-                                           end_key - 1); // the method expects inclusive
-        if (num_keys != my_segs[i].cum_keys) {
-            return false;
-        }
-        total_keys += num_keys;
-    }
-
-    if (end_key != data.back() + 1) return false;
-    if (total_keys != data.size()) return false;
-
-    return true;
-}
+using namespace liboxns;

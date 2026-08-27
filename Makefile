@@ -4,7 +4,7 @@ CXX = g++
 BENCHMARK_SRC = ./test/benchmark.cpp
 PARTITION_SRC = ./src/partition_optimization.cpp
 SEGMENT_SRC = ./src/segmentation.cpp
-HEADERS = ./src/libox.h ./src/segmentation.h ./src/libox_utils.h
+HEADERS = ./src/libox.h ./src/segmentation.h
 
 # Targets
 BENCHMARK = ./test/benchmark

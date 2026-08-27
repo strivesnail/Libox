@@ -10,10 +10,10 @@ size_t MAX_KEYS_IN_SEGMENT = INT64_MAX;
 
 using namespace liboxns;
 
-// using KeyType = int64_t; // For datasets like longitudes-200M
-// using KeyType = int64_t; // For datasets like longitudes-200M
-using KeyType = uint64_t; // For datasets like OSM
-using KeyType = uint64_t; // For datasets like OSM
+using KeyType = int64_t; // For datasets like longitudes-200M
+using KeyType = int64_t; // For datasets like longitudes-200M
+// using KeyType = uint64_t; // For datasets like OSM
+// using KeyType = uint64_t; // For datasets like OSM
 
 
 bool load_data(const std::string& input, std::vector<KeyType>& data) {
@@ -68,17 +68,6 @@ bool load_data(const std::string& input, std::vector<KeyType>& data) {
     return true;
 }
 
-// void process_data_shrink(std::vector<KeyType>& data) {
-//     sort(data.begin(), data.end());
-//     data.erase(unique(data.begin(), data.end()), data.end());
-
-//     vector<KeyType> shrunk_data;
-//     for (size_t i = 0; i < data.size(); i += SHRINK_FACTOR) {
-//         shrunk_data.push_back(data[i]);
-//     }
-//     data = std::move(shrunk_data);
-// }
-
 void process_data(std::vector<KeyType>& data) {
     sort(data.begin(), data.end());
     data.erase(unique(data.begin(), data.end()), data.end());
@@ -113,18 +102,15 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Finish loading the data. Original data size=" << data.size() << std::endl;
 
-    // SHRINK!
     process_data(data);
-    // process_data_shrink(data);
     std::cout << "data size=" << data.size() << ", min=" << data.front() << ", max=" << data.back()
               << std::endl;
 
-    // SHRINK!
     int max_look_ahead = 15;
     double underflow_threshold = 0.5;
     double overflow_threshold = 0.1;
     auto start_time = std::chrono::high_resolution_clock::now();
-    std::vector<keySegment<KeyType>> segments =
+    std::vector<KeySegment<KeyType>> segments =
         calculateSegments(data, overflow_threshold, underflow_threshold, max_look_ahead, data[0], data[0]);
     auto end_time = std::chrono::high_resolution_clock::now();
     std::vector<StructSegment<KeyType>> final_segments = toStructSegment(segments);
@@ -143,15 +129,6 @@ int main(int argc, char* argv[]) {
     std::cout << "calculateSegments execution time: " << duration_microseconds.count()
               << " microseconds (" << duration_seconds.count() << " seconds)" << std::endl;
 
-#ifndef NDEBUG
-    bool valid = validateSegments(data, segments);
-    if (valid) {
-        std::cout << "Confirmed that the segments are valid!" << std::endl;
-    } else {
-        std::cout << "ERROR/WARNING THE SEGMENTS ARE NOT VALID" << std::endl;
-    }
-#endif
-
     ofstream fout(output_file);
     if (!fout) {
         cerr << "Cannot open output file: " << output_file << endl;
@@ -168,9 +145,7 @@ int main(int argc, char* argv[]) {
             start = end;
             end = final_segments[i].seg_upper;
         }
-        // SHRINK!
         fout << start << "," << end << "," << final_segments[i].box_range << "\n";
-        // fout << start << "," << end << "," << final_segments[i].box_range / SHRINK_FACTOR << "\n";
     }
     fout.close();
     cout << "Segmentation results saved to " << output_file << endl;

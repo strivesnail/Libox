@@ -1135,7 +1135,7 @@ public:
                     #ifndef NDEBUG
                     // print the bounds of the segments before and after the split
                     cout << "Before split: " << endl;
-                    for (int i = seg_index; i < min(seg_index + 10, segments.size()); i++) {
+                    for (int i = seg_index; i < std::min(size_t(seg_index + 10), segments.size()); i++) {
                         cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
                     }
                     #endif
@@ -1146,7 +1146,7 @@ public:
                     #ifndef NDEBUG
                     // print 10 segments from seg_index to seg_index + 10
                     cout << "After split: " << endl;
-                    for (int i = seg_index; i < min(seg_index + 10, segments.size()); i++) {
+                    for (int i = seg_index; i < std::min(size_t(seg_index + 10), segments.size()); i++) {
                         cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
                     }
                     #endif
@@ -1324,11 +1324,11 @@ public:
         KeyType merged_lower = segment->getBoxLower(merge_start);
         KeyType merged_upper = segment->getBoxUpper(merge_end);
 
-        std::vector<keySegment<KeyType>> keysegments =
+        std::vector<KeySegment<KeyType>> KeySegments =
             calculateSegments(keys, overflowThreshold, underflowThreshold, 15, merged_lower, merged_upper);
         auto t6 = std::chrono::high_resolution_clock::now();
 
-        std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
+        std::vector<StructSegment<KeyType>> final_segments = toStructSegment(KeySegments);
         auto t7 = std::chrono::high_resolution_clock::now();
 
         // Create the middle merged segments
@@ -1752,12 +1752,12 @@ public:
         KeyType data_upper = sorted_data.back();
 
         // Calculate segments using the same algorithm
-        std::vector<keySegment<KeyType>> keysegments =
+        std::vector<KeySegment<KeyType>> KeySegments =
             calculateSegments(sorted_data, overflowThreshold, underflowThreshold, 
                             max_look_ahead, data_lower, data_upper);
 
         // Convert to StructSegment
-        std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
+        std::vector<StructSegment<KeyType>> final_segments = toStructSegment(KeySegments);
 
         // Create Segment objects
         for (const auto& struct_seg : final_segments) {
