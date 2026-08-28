@@ -30,10 +30,12 @@ sudo yum install gcc-c++ libomp-devel
 LiBox consists of three main components:
 
 - **libox.h**: Core learned index library with insert, search, and range query functionality
-- **segmentation.h**: Segmentation algorithm 
+- **segmentation.h**: Segmentation algorithm
 - **partition_optimization.cpp**: Data analysis tool for generating optimal configuration files
 
 ### Build
+
+Check that the KeyType and ValueType defined in `libox.h` and `partition_optimization.cpp` (default `int64_t`) are correct.
 
 ```bash
 # Clone the repository
