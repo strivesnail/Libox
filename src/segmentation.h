@@ -1,3 +1,4 @@
+#include "online_range.h"
 #include <stddef.h>
 
 #include <algorithm>
@@ -99,7 +100,7 @@ KeySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
     size_t num_look_ahead = 0;
     while (seg.end_idx < data.size() && num_look_ahead < max_look_ahead) {
         // exclusive
-        KeyType new_end_key = std::min(seg.end_key + window_size, data.back() + 1);
+        KeyType new_end_key = index_concurrency::advance_bounded(seg.end_key, window_size, KeyType(data.back() + 1));
 
         size_t new_end_idx =
             find_lower(data, seg.end_idx, seg.end_idx + BOX_CAPACITY * 2, new_end_key);
@@ -292,7 +293,22 @@ std::vector<KeySegment<KeyType>> calculateSegments(const std::vector<KeyType>& d
     }
 
     KeySegment<KeyType>& last_seg = segments.back();
-    if (newseg_upper > last_seg.end_key) last_seg.end_key = newseg_upper;
+    if (newseg_upper > last_seg.end_key) {
+        if constexpr(std::is_integral_v<KeyType>) {
+            using Wide=__int128_t;
+            if (Wide(newseg_upper)-Wide(last_seg.end_key) > Wide(last_seg.window_size)*64) {
+                // Do not allocate millions of narrow buckets for unseen keys.
+                // Represent a large empty suffix with bounded one-bucket ranges.
+                KeyType start=last_seg.end_key;
+                while(start<newseg_upper) {
+                    Wide width=std::min(Wide(newseg_upper)-Wide(start),Wide(std::numeric_limits<KeyType>::max()));
+                    KeySegment<KeyType> empty(data.size(),start,KeyType(width));
+                    empty.end_idx=data.size(); empty.end_key=KeyType(Wide(start)+width);
+                    segments.push_back(empty); start=empty.end_key;
+                }
+            } else last_seg.end_key=newseg_upper;
+        } else last_seg.end_key=newseg_upper;
+    }
 
     return segments;
 }

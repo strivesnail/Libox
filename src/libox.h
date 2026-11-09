@@ -2,6 +2,7 @@
 #include <omp.h>
 #include <xmmintrin.h>
 
+#include "online_range.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -672,7 +673,7 @@ public:
         // bucket for exact multiples, later published as an empty split range.
         if (upper <= lower || box_range == 0)
             throw std::invalid_argument("Segment requires nonempty half-open bounds and positive bucket width");
-        size_t total = upper - lower;
+        size_t total = index_concurrency::range_width(lower, upper);
         logical_box_count = total / box_range;
         if (total % box_range != 0) logical_box_count++;
 
@@ -747,7 +748,7 @@ public:
     ~Segment() {}
 
     size_t getLogicalBoxIndex(KeyType key) const {
-        return (key - lower_bound) / box_key_range;
+        return index_concurrency::range_width(lower_bound, key) / box_key_range;
     }
 
     size_t getPhysicalBoxIndex(size_t logical_box_index, uint8_t position_offset) const {
@@ -977,12 +978,14 @@ public:
     }
 
     KeyType getBoxLower(int box_index) const {
-        return lower_bound + box_index * box_key_range;
+        if constexpr(std::is_integral_v<KeyType>) return KeyType(__int128_t(lower_bound)+__int128_t(box_index)*box_key_range);
+        else return lower_bound + box_index * box_key_range;
     }
 
     KeyType getBoxUpper(int box_index) const {
-        KeyType candidate = lower_bound + (box_index + 1) * box_key_range;
-        return candidate > upper_bound ? upper_bound : candidate;
+        if constexpr(std::is_integral_v<KeyType>)
+            return KeyType(std::min(__int128_t(lower_bound)+(__int128_t(box_index)+1)*box_key_range,__int128_t(upper_bound)));
+        else return std::min<KeyType>(lower_bound+(box_index+1)*box_key_range,upper_bound);
     }
 
     KeyType getLowerBound() const { return lower_bound; }
@@ -1035,7 +1038,7 @@ private:
     std::vector<Segment<KeyType, ValueType>*> segments;
     std::vector<KeyType> segment_start_keys;
     std::vector<int32_t> redundantArray;
-    double a, b;
+    double a;
 
     std::atomic<int> waiting_for_critical_section_{0};
 
@@ -1113,20 +1116,35 @@ public:
         }
     }
 
+    void growDirectory(KeyType key) {
+        const bool empty=segments.empty();
+        const bool before=!empty && key<segments.front()->getLowerBound();
+        auto bounds=empty ? index_concurrency::first_range(key)
+            : index_concurrency::adjacent_range(key,
+                (before?segments.front():segments.back())->getLowerBound(),
+                (before?segments.front():segments.back())->getUpperBound(),before);
+        auto fresh=std::make_unique<Segment<KeyType,ValueType>>(bounds.lower,bounds.upper,bounds.width,thread_num);
+        if(empty) { segments.push_back(fresh.get()); segment_start_keys={bounds.lower,bounds.upper}; }
+        else if(before) { segments.insert(segments.begin(),fresh.get()); segment_start_keys.insert(segment_start_keys.begin(),bounds.lower); }
+        else { segments.push_back(fresh.get()); segment_start_keys.back()=bounds.lower; segment_start_keys.push_back(bounds.upper); }
+        fresh.release(); buildSearchIndex();
+    }
+
     InsertResult insertKeyValue(KeyType key, ValueType value) {
         for (;;) {
             {
                 index_concurrency::QuiescenceGate::ReadGuard read(topology_gate_);
                 int32_t position = searchIndex(key);
-                if (position < 0) return {InsertStatus::OUT_OF_RANGE, -1};
-                auto result = segments[position]->insertKeyValue(key, value);
-                if (result.status != InsertStatus::FULL) return result;
+                if (position >= 0) {
+                    auto result = segments[position]->insertKeyValue(key, value);
+                    if (result.status != InsertStatus::FULL) return result;
+                }
             }
             // No directory index or segment pointer survives the read-to-write
             // transition. Recheck the current directory under exclusive access.
             index_concurrency::QuiescenceGate::WriteGuard write(topology_gate_);
             int32_t position = searchIndex(key);
-            if (position < 0) return {InsertStatus::OUT_OF_RANGE, -1};
+            if (position < 0) { growDirectory(key); continue; }
             auto* segment = segments[position];
             auto result = segment->insertKeyValue(key, value);
             if (result.status != InsertStatus::FULL) return result;
@@ -1138,6 +1156,7 @@ public:
 
     DeleteResult deleteKey(KeyType key) {
         index_concurrency::QuiescenceGate::ReadGuard read(topology_gate_);
+        if (segments.empty()) return {DeleteStatus::NOT_FOUND,false};
         int retry_count = 0;
 
     retry_delete:
@@ -1162,6 +1181,7 @@ public:
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
         index_concurrency::QuiescenceGate::ReadGuard read(topology_gate_);
+        if (segments.empty()) return {SearchStatus::NOT_FOUND,ValueType{}};
         int retry_count = 0;
 
     retry_search:
@@ -1525,12 +1545,11 @@ public:
                 << (memory_bytes / 1024.0) << " KB, "
                 << (memory_bytes / 1024.0 / 1024.0) << " MB)" << std::endl;
 
-        a = static_cast<double>(redundantSize - 1) /
-                      (segment_start_keys.back() - segment_start_keys.front());
-        b = -a * segment_start_keys.front();
+        a = static_cast<double>((redundantSize-1) /
+              (static_cast<long double>(segment_start_keys.back())-static_cast<long double>(segment_start_keys.front())));
 
         for (size_t i = 0; i < segment_start_keys.size(); i++) {
-            int64_t position = static_cast<int64_t>(a * segment_start_keys[i] + b);
+            int64_t position = static_cast<int64_t>(a * index_concurrency::range_width(segment_start_keys.front(),segment_start_keys[i]));
             if (position >= 0 && position < redundantSize) {
                 redundantArray[position] = i;
             }
@@ -1548,14 +1567,16 @@ public:
     }
 
     int32_t searchIndex(KeyType key) {
+        if (segment_start_keys.empty()) return BELOW_LOWER_BOUND;
         if (key < segment_start_keys.front()) {
             return BELOW_LOWER_BOUND;
         } else if (key >= segment_start_keys.back()) {
             return ABOVE_UPPER_BOUND;
         }
 
-        int64_t position = static_cast<int64_t>(a * key + b);
-        int32_t estimatedIndex = redundantArray[position];
+        int64_t position = static_cast<int64_t>(a * index_concurrency::range_width(segment_start_keys.front(),key));
+        position=std::clamp<int64_t>(position,0,redundantArray.size()-1);
+        int32_t estimatedIndex = std::clamp<int32_t>(redundantArray[position],0,segments.size()-1);
 
         int32_t left_boundary = estimatedIndex;
         while (left_boundary > 0 &&
@@ -1699,7 +1720,7 @@ public:
 
         if (!segments.empty()) {
             segment_start_keys.push_back(
-                segments.back()->getUpperBound() + 1);
+                segments.back()->getUpperBound());
         }
 
         insertEmptySlots(emptySlots_between);
@@ -1742,7 +1763,7 @@ public:
 
         if (!segments.empty()) {
             segment_start_keys.push_back(
-                segments.back()->getUpperBound() + 1);
+                segments.back()->getUpperBound());
         }
 
         insertEmptySlots(emptySlots_between);
