@@ -1,0 +1,55 @@
+Concurrent split repair and regression checks
+============================================
+
+Run from the repository root (AVX-512 and OpenMP required):
+  python3 test/run_concurrency_checks.py
+The default builds use ASan+UBSan. --quick uses one seed instead of three;
+--release uses optimized code without sanitizers. Logs and status.json are
+written to build/concurrency-checks/. Leak checking is disabled because the
+existing bucket-array ownership/leaks are outside this change's scope.
+
+The checks cover:
+- Reader/writer admission, shared reader-slot aliases and exception cleanup.
+- Half-open interval bucket counts and invalid segment arguments.
+- Concurrent inserts, reads of newly inserted and old keys, and full-value
+  validation after each of four phases; random and ordered hotspot inserts.
+- Thread counts 1,4,24 (limited to available CPUs), seeds42/43/44.
+- RiB-tree uses fanout8 only in this regression, exercising recursive inner
+  splits; it also checks leaf depth, separator keys, descriptor order, and
+  unlocked node versions after each phase. This is not a performance setting.
+
+Repair rationale:
+Ordinary operations enter a per-index quiescence gate. Separate cache-line
+reader counters avoid a single contended reference-count cache line. Before
+rebuilding, close admission, drain active operations, and serialize topology
+writers. Re-route after dropping read admission: no observed segment pointer
+or path may survive the transition. Publish the new structure and reclaim old
+segment objects before reopening admission. Ordinary bucket operations remain
+concurrent. Rebuilds temporarily block other operations across the index;
+this is a conservative correctness tradeoff, not the paper's nonblocking EBR
+scheme. Bulk loading and direct internal SMO helpers are initialization/internal
+interfaces, not concurrently callable public operations.
+
+Both implementations also counted upper-lower+1 for [lower,upper) ranges.
+An exact multiple of the bucket width then allocated one phantom bucket;
+a later rebuild could publish an empty [x,x) descriptor. Bucket allocation
+now uses upper-lower, and rejects empty ranges or a zero bucket width.
+
+The changes fix the observed directory-overflow, old-segment lifetime and
+empty-descriptor regressions. Passing these tests is not a proof of general
+race freedom. Keep before/after performance measurements separate from
+functional correctness and reject throughput results from invalid runs.
+
+Validation recorded for this repair:
+- 40 sanitizer checks across the two repositories, plus the four original
+  ASan failure reproducers, passed.
+- 56 range/leaf split stress runs passed; 50 repeats of the previously rare
+  Financial1 WO24 failure passed after fixing the half-open bucket count.
+- 36 MSR web_2 forced-split runs and 108 normal-workload runs passed full
+  expected-value validation (1/4/24 threads, three seeds for MSR).
+- Normal-workload medians versus the frozen pre-concurrency checkpoints
+  720012b (RiB-tree) and fd7754b (LiBox) changed by -4.99%..+2.00% for
+  RiB-tree and -1.92%..+2.04% for LiBox. Three short-pass repetitions are
+  exploratory, not statistical proof of performance equivalence.
+- MSR uses the complete public web_2 byte-offset trace, 1321270 unique keys;
+  it is not a verified copy of the manuscript's preprocessed key set.

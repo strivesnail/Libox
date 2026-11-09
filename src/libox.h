@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "segmentation.h"
+#include "concurrent_gate.h"
 
 #define SORT_BOX
 
@@ -667,7 +668,11 @@ public:
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
           operation_counter_(thread_num), num_threads(thread_num) {
 
-        size_t total = upper - lower + 1;
+        // Range bounds are [lower, upper). Counting upper created a phantom
+        // bucket for exact multiples, later published as an empty split range.
+        if (upper <= lower || box_range == 0)
+            throw std::invalid_argument("Segment requires nonempty half-open bounds and positive bucket width");
+        size_t total = upper - lower;
         logical_box_count = total / box_range;
         if (total % box_range != 0) logical_box_count++;
 
@@ -1020,6 +1025,7 @@ public:
 template <typename KeyType, typename ValueType>
 class LiBox {
 private:
+    index_concurrency::QuiescenceGate topology_gate_;
     // Static mutex for thread-safe printing
     static std::mutex print_mutex_;
 
@@ -1087,7 +1093,7 @@ private:
     }
 public:
     LiBox(double uThreshold, double oThreshold, int thread_num)
-        : underflowThreshold(uThreshold),
+        : topology_gate_(thread_num), underflowThreshold(uThreshold),
           overflowThreshold(oThreshold),
           thread_num(thread_num){
         ThreadIdManager::initialize(thread_num);
@@ -1108,85 +1114,30 @@ public:
     }
 
     InsertResult insertKeyValue(KeyType key, ValueType value) {
-        InsertResult result;
-        int retry_count = 0;
-        int32_t seg_index = -1;
-        Segment<KeyType, ValueType>* target_segment = nullptr;
-
-        retry_insert:
-        {
-            seg_index = searchIndex(key);
-            if (seg_index < 0) {
-                return {InsertStatus::OUT_OF_RANGE, -1};
-            }
-
-            result = segments[seg_index]->insertKeyValue(key, value);
-            target_segment = segments[seg_index];
-            if (result.status == InsertStatus::SUCCESS) {
-                return result;
-            }
-        }
-
-        if (result.status == InsertStatus::FULL) {
-            if (target_segment->try_mark_for_splitting()) {
-                {
-                    std::lock_guard<std::mutex> lock(print_mutex_);
-                    cout << "Split " << seg_index << endl;
-                    #ifndef NDEBUG
-                    // print the bounds of the segments before and after the split
-                    cout << "Before split: " << endl;
-                    for (int i = seg_index; i < std::min(size_t(seg_index + 10), segments.size()); i++) {
-                        cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
-                    }
-                    #endif
-                }
-                splitSegment(target_segment, result.box_index);
-                {
-                    std::lock_guard<std::mutex> lock(print_mutex_);
-                    #ifndef NDEBUG
-                    // print 10 segments from seg_index to seg_index + 10
-                    cout << "After split: " << endl;
-                    for (int i = seg_index; i < std::min(size_t(seg_index + 10), segments.size()); i++) {
-                        cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
-                    }
-                    #endif
-                }
-            }else {
-                exponential_backoff(retry_count++);
-                goto retry_insert;
-            }
-            goto retry_insert;
-        } else if (result.status == InsertStatus::SPLIT) {
-            auto wait_start = std::chrono::high_resolution_clock::now();
-            target_segment->wait_for_split_completion();
-            auto wait_end = std::chrono::high_resolution_clock::now();
-            auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
-            is_segment_splitting_insert_wait_stats_.record_wait(wait_duration);
-            goto retry_insert;
-        } else if (result.status == InsertStatus::OUT_OF_RANGE) {
+        for (;;) {
             {
-                std::lock_guard<std::mutex> lock(print_mutex_);
-                cout << "Out-of-range: segidx=" << seg_index << ", total_segments="
-                     << segments.size() << ", key=" << key;
-
-                if (seg_index - 1 >= 0) {
-                    cout << ", prevSegBounds=(" << segments[seg_index - 1]->getLowerBound() << ", " << segments[seg_index - 1]->getUpperBound() << ")";
-                }
-
-                cout << ", currSegBounds=(" << segments[seg_index]->getLowerBound() << ", " << segments[seg_index]->getUpperBound() << ")";
-
-                if (seg_index + 1 < segments.size()) {
-                    cout << ", nextSegBounds=(" << segments[seg_index + 1]->getLowerBound() << ", " << segments[seg_index + 1]->getUpperBound() << ")";
-                }
-                cout << endl;
-       
+                index_concurrency::QuiescenceGate::ReadGuard read(topology_gate_);
+                int32_t position = searchIndex(key);
+                if (position < 0) return {InsertStatus::OUT_OF_RANGE, -1};
+                auto result = segments[position]->insertKeyValue(key, value);
+                if (result.status != InsertStatus::FULL) return result;
             }
-            throw std::runtime_error("Unexpected OUT_OF_RANGE status in insertKeyValue");
+            // No directory index or segment pointer survives the read-to-write
+            // transition. Recheck the current directory under exclusive access.
+            index_concurrency::QuiescenceGate::WriteGuard write(topology_gate_);
+            int32_t position = searchIndex(key);
+            if (position < 0) return {InsertStatus::OUT_OF_RANGE, -1};
+            auto* segment = segments[position];
+            auto result = segment->insertKeyValue(key, value);
+            if (result.status != InsertStatus::FULL) return result;
+            if (!segment->try_mark_for_splitting())
+                throw std::runtime_error("Segment already marked under exclusive topology access");
+            splitSegment(segment, result.box_index);
         }
-        return result;
     }
 
     DeleteResult deleteKey(KeyType key) {
+        index_concurrency::QuiescenceGate::ReadGuard read(topology_gate_);
         int retry_count = 0;
 
     retry_delete:
@@ -1210,6 +1161,7 @@ public:
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
+        index_concurrency::QuiescenceGate::ReadGuard read(topology_gate_);
         int retry_count = 0;
 
     retry_search:
@@ -1325,6 +1277,7 @@ public:
         // Early return if no entries to process
         if (mergedEntries.empty()) {
             segment->unmark_splitting();
+            segment->splitting_.store(false, std::memory_order_release);
             return;
         }
 
