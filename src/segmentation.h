@@ -176,13 +176,9 @@ KeySegment<KeyType> findBestSegment(const std::vector<KeyType>& data,
             best_seg = seg;
         }
     }
-#ifndef NDEBUG
-    if (best_seg.cum_keys < BOX_CAPACITY) {
-        throw std::runtime_error(
-            "findBestSegment: best segment is smaller than BOX_CAPACITY; the \"worst\" segment should have min 64 keys (cum_keys=" +
-            std::to_string(best_seg.cum_keys) + ")");
-    }
-#endif
+    // A short valid segment is permitted, and no candidate may be valid.
+    // calculateSegments handles the latter with its progress fallback.
+
     return best_seg;
 }
 
@@ -257,7 +253,7 @@ std::vector<KeySegment<KeyType>> calculateSegments(const std::vector<KeyType>& d
         if (data.size() - cur_idx < (1 - underflow_threshold) * BOX_CAPACITY) {
             // the remaining data cannot be made into a valid box, so we forcibly create an
             // underflowing segment
-            KeySegment<KeyType> seg(cur_idx, cur_key, data.back() - cur_key);
+            KeySegment<KeyType> seg(cur_idx, cur_key, data.back() - cur_key + 1);
             seg.end_idx = data.size();
             seg.end_key = data.back() + 1;
             segments.push_back(seg);
@@ -272,6 +268,14 @@ std::vector<KeySegment<KeyType>> calculateSegments(const std::vector<KeyType>& d
                                                overflow_threshold,
                                                underflow_threshold,
                                                max_look_ahead);
+        if (seg.end_idx <= cur_idx) {
+            const size_t end = std::min(cur_idx + static_cast<size_t>(BOX_CAPACITY), data.size());
+            seg = KeySegment<KeyType>(cur_idx, cur_key, data[end - 1] - cur_key + 1);
+            seg.end_idx = end;
+            seg.end_key = data[end - 1] + 1;
+            seg.cum_keys = end - cur_idx;
+            seg.cum_underflow = BOX_CAPACITY - seg.cum_keys;
+        }
         cur_idx = seg.end_idx;
         cur_key = seg.end_key;
 

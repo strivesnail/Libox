@@ -451,7 +451,7 @@ class Box {
     }
 
     size_t getTotalCount() const {
-        return maxSize;
+        return validSize;
     }
 
     DeleteResult deleteKey(KeyType key) {
@@ -617,22 +617,20 @@ class Box {
     vector<pair<KeyType, ValueType>> getEntries() const {
         vector<pair<KeyType, ValueType>> entries;
         for (size_t i = 0; i < maxSize; i++) {
-            entries.push_back({keys[i], values[i]});
+            if (valid_flags[i]) entries.push_back({keys[i], values[i]});
         }
         return entries;
     }
 
     void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries) const {
         size_t start_size = entries->size();
-        entries->resize(start_size + maxSize);
-        for (size_t i = 0; i < maxSize; i++) {
-            (*entries)[start_size + i] = {keys[i], values[i]};
-        }
+        entries->resize(start_size + validSize);
+        getEntriesInPlace(entries, start_size);
     }
 
     void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries, size_t start_pos) const {
         for (size_t i = 0; i < maxSize; i++) {
-            (*entries)[start_pos + i] = {keys[i], values[i]};
+            if (valid_flags[i]) (*entries)[start_pos++] = {keys[i], values[i]};
         }
     }
 };
@@ -849,7 +847,9 @@ public:
         }
 
         // No empty slots found, try to expand to a new physical box
-        while (current_position < PHYSICAL_BOXES_PER_LOGICAL) {
+        // current_position is already an index; incrementing the last valid
+        // index would write into the next logical bucket (or beyond allocation).
+        while (current_position + 1 < PHYSICAL_BOXES_PER_LOGICAL) {
             uint8_t expected = current_position;
             if (logical_box_write_positions[logical_box_index].compare_exchange_weak(
                 expected, current_position + 1,
@@ -1238,10 +1238,16 @@ public:
         for (const auto& entry : mergedEntries) {
             KeyType key = entry.first;
             ValueType value = entry.second;
-            if (key >= new_segments[current_seg]->getUpperBound()) {
+            while (current_seg < new_segments.size() && key >= new_segments[current_seg]->getUpperBound()) {
                 current_seg++;
             }
-            new_segments[current_seg]->insertKeyValue(key, value);
+            if (current_seg == new_segments.size()) {
+                throw std::runtime_error("Redistribution key outside new segments");
+            }
+            auto result = new_segments[current_seg]->insertKeyValue(key, value);
+            if (result.status != InsertStatus::SUCCESS) {
+                throw std::runtime_error("Redistribution insertion failed");
+            }
         }
     }
 
@@ -1257,16 +1263,24 @@ public:
             }
         }
 
-        for (int i = start_pos; i <= end_pos; i++) {
-            int new_seg_index = i - start_pos;
-            if (new_seg_index < static_cast<int>(new_segments.size())) {
-                segments[i] = new_segments[new_seg_index];
-                segment_start_keys[i] = new_segment_start_keys[new_seg_index];
-            } else {
-                segments[i] = new_segments.back();
-                segment_start_keys[i] = new_segment_start_keys.back();
-            }
+        if (start_pos < 0 || new_segments.empty() ||
+            new_segments.size() != new_segment_start_keys.size()) {
+            throw std::runtime_error("Invalid segment replacement");
         }
+
+        // Preserve spare aliases, but grow the directory when all replacements
+        // cannot fit in the old segment's slots. Never discard split results.
+        const size_t old_slots = end_pos - start_pos + 1;
+        while (new_segments.size() < old_slots) {
+            new_segments.push_back(new_segments.back());
+            new_segment_start_keys.push_back(new_segment_start_keys.back());
+        }
+        segments.erase(segments.begin() + start_pos, segments.begin() + end_pos + 1);
+        segments.insert(segments.begin() + start_pos, new_segments.begin(), new_segments.end());
+        segment_start_keys.erase(segment_start_keys.begin() + start_pos,
+                                 segment_start_keys.begin() + end_pos + 1);
+        segment_start_keys.insert(segment_start_keys.begin() + start_pos,
+                                  new_segment_start_keys.begin(), new_segment_start_keys.end());
 
         buildSearchIndex();
     }
@@ -1302,6 +1316,8 @@ public:
 
         // Extract entries from the logical boxes to be merged
         auto mergedEntries = segment->prepare_for_split_stage1(merge_start, merge_end);
+        std::sort(mergedEntries.begin(), mergedEntries.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
         auto t4 = std::chrono::high_resolution_clock::now();
 
         size_t merged_entries_size = mergedEntries.size();
@@ -1548,7 +1564,7 @@ public:
         if (segment_start_keys.empty()) return;
 
         int64_t redundantSize = segment_start_keys.size() * 90;
-        redundantArray.resize(redundantSize, -1);
+        redundantArray.assign(redundantSize, -1);
 
         size_t memory_bytes = redundantSize * sizeof(int32_t);
         std::cout << "redundantArray size: " << redundantSize << " elements" << std::endl;

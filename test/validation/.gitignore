@@ -1,0 +1,6 @@
+results/*_functional
+results/*_performance
+results/*_hotspot
+results/*_asan
+results/functional*
+__pycache__/
