@@ -33,6 +33,15 @@ int main(int argc,char**argv){
  #pragma omp parallel for schedule(static)
  for(size_t i=0;i<batch.size();++i)put(batch[i]);
  for(Key key:batch)if(!get(key))throw std::runtime_error("concurrent growth lost keys");
+ // Force simultaneous left/right expansion, and recheck the previous ranges.
+ std::vector<Key> outside;
+ for(Key i=0;i<8192;++i)outside.push_back((i%2?-1:1)*((Key(1)<<50)+i*4096));
+ #pragma omp parallel for schedule(static)
+ for(size_t i=0;i<outside.size();++i)put(outside[i]);
+ for(Key key:outside)if(!get(key))throw std::runtime_error("bidirectional concurrent growth lost keys");
+ for(Key key:batch)if(!get(key))throw std::runtime_error("bidirectional growth corrupted old batch");
+ for(Key key:keys)if(!get(key))throw std::runtime_error("bidirectional growth corrupted original keys");
+
  for(Key i=0;i<1024;++i){put(std::numeric_limits<Key>::lowest()+i);put(std::numeric_limits<Key>::max()-1-i);}
  for(Key i=0;i<1024;++i)if(!get(std::numeric_limits<Key>::lowest()+i)||!get(std::numeric_limits<Key>::max()-1-i))throw std::runtime_error("extreme signed keys lost");
  bool rejected=false;try{put(std::numeric_limits<Key>::max());}catch(const std::out_of_range&){rejected=true;}
