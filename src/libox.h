@@ -381,18 +381,19 @@ class Box {
 
     Box() {}
 
-    Box(const Box& other)
-        : maxSize(other.maxSize),
-          validSize(other.validSize),
-          nearestEmptySlot(other.nearestEmptySlot) {
+    Box(const Box& other) {
+        // Counts, validity and payloads must belong to the same source version.
         while (true) {
             uint32_t version_start;
             if (other.test_write_lock(version_start)) {
                 std::this_thread::yield();
                 continue;
             }
-            kv_entries_ = other.kv_entries_;
+            maxSize = other.maxSize;
+            validSize = other.validSize;
+            nearestEmptySlot = other.nearestEmptySlot;
             valid_flags = other.valid_flags;
+            kv_entries_ = other.kv_entries_;
             keys_low = other.keys_low;
             if (!other.version_changed(version_start)) {
                 break;
