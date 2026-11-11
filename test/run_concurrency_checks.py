@@ -12,6 +12,7 @@ def build(source,binary,extra=()):subprocess.run([cxx,*flags,*extra,str(root/sou
 build('test/concurrent_gate_regression.cpp','gate')
 build('test/empty_start_regression.cpp','empty',['-DLIBOX'] if is_libox else [])
 build('test/segment_bounds_regression.cpp','bounds',['-DLIBOX'] if is_libox else [])
+build('test/segment_layout_regression.cpp','layout',['-DLIBOX'] if is_libox else [])
 # Small fanout is deliberate: exercise recursive inner splits, not just buckets.
 build('test/concurrent_split_regression.cpp','split',['-DLIBOX'] if is_libox else ['-DSPLIT_THRESHOLD=8'])
 env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',UBSAN_OPTIONS='halt_on_error=1',OMP_PROC_BIND='TRUE',OMP_DYNAMIC='FALSE')
@@ -25,8 +26,9 @@ def run(name,cmd,threads):
  if code!=0:raise SystemExit(f'Failed: {name}; see {out}')
 run('gate',[out/'gate'],min(4,len(cpus)))
 run('bounds',[out/'bounds'],1)
-for threads in [t for t in [1,4,24] if t<=len(cpus)]:run(f'empty_t{threads}',[out/'empty',threads],threads)
-for threads in [t for t in [1,4,24] if t<=len(cpus)]:
+run('layout',[out/'layout'],1)
+for threads in [t for t in [1,4,5,10,24] if t<=len(cpus)]:run(f'empty_t{threads}',[out/'empty',threads],threads)
+for threads in [t for t in [1,4,5,10,24] if t<=len(cpus)]:
  for seed in ([42] if args.quick else [42,43,44]):
   for order in ['random','sorted']:
    run(f'split_t{threads}_s{seed}_{order}',[out/'split',threads,seed,order],threads)

@@ -3,6 +3,7 @@
 #include <xmmintrin.h>
 
 #include "online_range.h"
+#include "atomic_box.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -64,20 +65,15 @@ void exponential_backoff(int retry_count);
 class ThreadIdManager {
 private:
     static thread_local int cached_thread_id_;
-    static int max_thread_num_;
 
 public:
     static void initialize(int max_threads) {
-        max_thread_num_ = max_threads;
+        if (max_threads <= 0) throw std::invalid_argument("thread count must be positive");
     }
 
     static int get_thread_id() {
-        if (cached_thread_id_ == -1) {
-            cached_thread_id_ = omp_get_thread_num();
-            if (cached_thread_id_ >= max_thread_num_) {
-                cached_thread_id_ = cached_thread_id_ % max_thread_num_;
-            }
-        }
+        // Each owning counter maps this cached ID into its own slot array.
+        if (cached_thread_id_ == -1) cached_thread_id_ = omp_get_thread_num();
         return cached_thread_id_;
     }
 
@@ -87,7 +83,6 @@ public:
 };
 
 thread_local int ThreadIdManager::cached_thread_id_ = -1;
-int ThreadIdManager::max_thread_num_ = 0;
 
 class ThreadLocalCounter {
 private:
@@ -101,16 +96,19 @@ private:
 public:
     explicit ThreadLocalCounter(int thread_num)
         : thread_num_(thread_num) {
+        if (thread_num <= 0) throw std::invalid_argument("thread count must be positive");
         thread_counters_ = std::make_unique<ThreadCounter[]>(thread_num);
     }
 
     void increment() {
         int slot = ThreadIdManager::get_thread_id();
+        if (slot >= thread_num_) slot %= thread_num_;
         thread_counters_[slot].count.fetch_add(1, std::memory_order_relaxed);
     }
 
     void decrement() {
         int slot = ThreadIdManager::get_thread_id();
+        if (slot >= thread_num_) slot %= thread_num_;
         thread_counters_[slot].count.fetch_sub(1, std::memory_order_relaxed);
     }
 
@@ -136,9 +134,9 @@ public:
 class ThreadLocalWaitTimingStats {
 private:
     struct alignas(64) ThreadTimingStats {
-        uint64_t total_wait_count{0};
-        uint64_t total_wait_time_ns{0};
-        uint64_t max_wait_time_ns{0};
+        std::atomic<uint64_t> total_wait_count{0};
+        std::atomic<uint64_t> total_wait_time_ns{0};
+        std::atomic<uint64_t> max_wait_time_ns{0};
         char padding[40]; // Ensure 64-byte alignment
     };
 
@@ -149,18 +147,20 @@ private:
 public:
     explicit ThreadLocalWaitTimingStats(int thread_num, const std::string& name = "")
         : thread_num_(thread_num), name_(name) {
+        if (thread_num <= 0) throw std::invalid_argument("thread count must be positive");
         thread_stats_ = std::make_unique<ThreadTimingStats[]>(thread_num);
     }
 
     void record_wait(uint64_t wait_time_ns) {
         int slot = ThreadIdManager::get_thread_id();
+        if (slot >= thread_num_) slot %= thread_num_;
         assert(slot < thread_num_);
         auto& stats = thread_stats_[slot];
-        stats.total_wait_count++;
-        stats.total_wait_time_ns += wait_time_ns;
-        if (wait_time_ns > stats.max_wait_time_ns) {
-            stats.max_wait_time_ns = wait_time_ns;
-        }
+        stats.total_wait_count.fetch_add(1, std::memory_order_relaxed);
+        stats.total_wait_time_ns.fetch_add(wait_time_ns, std::memory_order_relaxed);
+        auto old_max = stats.max_wait_time_ns.load(std::memory_order_relaxed);
+        while (wait_time_ns > old_max && !stats.max_wait_time_ns.compare_exchange_weak(
+                   old_max, wait_time_ns, std::memory_order_relaxed)) {}
     }
 
     void print_stats() {
@@ -274,9 +274,10 @@ struct tas_lock {
 template <typename KeyType, typename ValueType>
 class Box {
    private:
-    size_t maxSize = 0;
-    size_t validSize = 0;
-    size_t nearestEmptySlot = 0;
+    index_concurrency::AtomicCell<size_t> maxSize{0};
+    index_concurrency::AtomicCell<size_t> validSize{0};
+    index_concurrency::AtomicCell<size_t> nearestEmptySlot{0};
+    index_concurrency::AtomicBitmap64 valid_flags;
 
 #ifdef LOCK_SEARCH_SPIN_LOCK
     tas_lock lock_;
@@ -286,10 +287,10 @@ class Box {
     static constexpr uint32_t WRITE_LOCK_BIT = 0x80000000;
     static constexpr uint32_t VERSION_MASK   = 0x7FFFFFFF;
 
-    alignas(64) array<KeyType, maxKey> keys;
-    bitset<maxKey> valid_flags;
-    alignas(64) array<uint8_t, maxKey> keys_low;  // Keep for AVX512 optimization
-    alignas(64) array<ValueType, maxKey> values;
+    alignas(64) index_concurrency::AtomicFingerprints64 keys_low;  // Keep for AVX512 optimization
+    // Verification and value retrieval share a cache line for 64-bit KV.
+    struct Entry { index_concurrency::AtomicCell<KeyType> key; index_concurrency::AtomicCell<ValueType> value; };
+    alignas(64) array<Entry, maxKey> kv_entries_;
 
     inline bool test_write_lock(uint32_t &version) const {
         version = version_lock_.load(std::memory_order_acquire);
@@ -314,23 +315,34 @@ class Box {
 
     inline void release_write_lock() {
         uint32_t current = version_lock_.load(std::memory_order_relaxed);
-        uint32_t new_version = current + 1 - WRITE_LOCK_BIT;
+        uint32_t new_version = ((current & VERSION_MASK) + 1) & VERSION_MASK;
         version_lock_.store(new_version, std::memory_order_release);
     }
 
+    static uint8_t fingerprint(KeyType key) {
+        if constexpr (std::is_integral_v<KeyType>) {
+            uint64_t bits = static_cast<uint64_t>(key);
+            bits ^= bits >> 33;
+            bits *= UINT64_C(0xff51afd7ed558ccd);
+            bits ^= bits >> 33;
+            const uint8_t fp = static_cast<uint8_t>(bits >> 56);
+            return fp ? fp : 1; // zero denotes an unused fingerprint slot
+        } else {
+            const uint8_t low = static_cast<uint8_t>(key);
+            return ((low * 251) % 255) + 1;
+        }
+    }
+
     size_t findKeyIndex(KeyType key) const {
-        // Keep original hash function for better distribution
-        // Note: Compiler may optimize % 255 using bit operations (255 = 2^8 - 1)
-        uint8_t key_low = static_cast<uint8_t>(key);
-        uint8_t target_low = ((key_low * 251) % 255) + 1;
+        uint8_t target_low = fingerprint(key);
 
         __m512i v_target_low = _mm512_set1_epi8(target_low);
-        __m512i v_keys_low = _mm512_load_si512(reinterpret_cast<const __m512i*>(keys_low.data()));
+        __m512i v_keys_low = keys_low.loadVector();
         __mmask64 mask_low = _mm512_cmpeq_epi8_mask(v_keys_low, v_target_low);
 
         while (mask_low) {
             size_t candidate = __builtin_ctzll(mask_low);
-            if (keys[candidate] == key && valid_flags[candidate] && candidate < maxSize) {
+            if (candidate < maxSize && valid_flags[candidate] && kv_entries_[candidate].key == key) {
                 return candidate;
             }
             // Move mask update after the if-statement for clarity and potential compiler optimization
@@ -355,6 +367,17 @@ class Box {
     }
 
    public:
+#if defined(INDEX_PREFETCH_KV_LINES) && INDEX_PREFETCH_KV_LINES > 0
+    // Optional, workload-dependent lookahead; disabled in the default build.
+    void prefetchForSearch() const {
+        static_assert(INDEX_PREFETCH_KV_LINES <= 16);
+        _mm_prefetch(reinterpret_cast<const char*>(keys_low.data()), _MM_HINT_T0);
+        constexpr size_t bytes = std::min(size_t(INDEX_PREFETCH_KV_LINES) * 64, sizeof(kv_entries_));
+        for (size_t offset = 0; offset < bytes; offset += 64)
+            _mm_prefetch(reinterpret_cast<const char*>(kv_entries_.data()) + offset, _MM_HINT_T0);
+    }
+#endif
+
     Box() {}
 
     Box(const Box& other)
@@ -367,10 +390,9 @@ class Box {
                 std::this_thread::yield();
                 continue;
             }
-            keys = other.keys;
+            kv_entries_ = other.kv_entries_;
             valid_flags = other.valid_flags;
             keys_low = other.keys_low;
-            values = other.values;
             if (!other.version_changed(version_start)) {
                 break;
             }
@@ -391,10 +413,9 @@ class Box {
                 maxSize = other.maxSize;
                 validSize = other.validSize;
                 nearestEmptySlot = other.nearestEmptySlot;
-                keys = other.keys;
+                kv_entries_ = other.kv_entries_;
                 valid_flags = other.valid_flags;
                 keys_low = other.keys_low;
-                values = other.values;
                 if (!other.version_changed(version_start)) {
                     break;
                 }
@@ -408,10 +429,9 @@ class Box {
         : maxSize(other.maxSize),
           validSize(other.validSize),
           nearestEmptySlot(other.nearestEmptySlot),
-          keys(std::move(other.keys)),
           valid_flags(std::move(other.valid_flags)),
           keys_low(std::move(other.keys_low)),
-          values(std::move(other.values)) {
+          kv_entries_(std::move(other.kv_entries_)) {
 
         version_lock_.store(other.version_lock_.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
@@ -426,10 +446,9 @@ class Box {
             maxSize = other.maxSize;
             validSize = other.validSize;
             nearestEmptySlot = other.nearestEmptySlot;
-            keys = std::move(other.keys);
+            kv_entries_ = std::move(other.kv_entries_);
             valid_flags = std::move(other.valid_flags);
             keys_low = std::move(other.keys_low);
-            values = std::move(other.values);
 
             release_write_lock();
         }
@@ -489,6 +508,10 @@ class Box {
     }
 
     InsertResult insertKeyValue(KeyType key, ValueType value) {
+        const uint8_t prepared_fp = fingerprint(key);
+        // Compiler-only barrier: prepare the independent hash before taking
+        // the writer lock, without adding a CPU fence to the lookup path.
+        asm volatile("" : : "r"(prepared_fp) : "memory");
         int retry_count = 0;
 
     retry_write:
@@ -506,16 +529,23 @@ class Box {
             goto retry_write;
         }
 
+        const size_t existing = findKeyIndex(key);
+        if (existing != maxKey) {
+            kv_entries_[existing].value = value;
+            uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
+            version_lock_.store(new_version, std::memory_order_release);
+            return {InsertStatus::SUCCESS, -1};
+        }
+
         if (nearestEmptySlot >= maxKey) {
             uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
             version_lock_.store(new_version, std::memory_order_release);
             return {InsertStatus::FULL, -1};
         }
 
-        keys[nearestEmptySlot] = key;
-        values[nearestEmptySlot] = value;
-        uint8_t key_low = static_cast<uint8_t>(key);
-        keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
+        kv_entries_[nearestEmptySlot].key = key;
+        kv_entries_[nearestEmptySlot].value = value;
+        keys_low[nearestEmptySlot] = prepared_fp;
         valid_flags[nearestEmptySlot] = true;
         validSize++;
         if (nearestEmptySlot == maxSize) {
@@ -529,39 +559,19 @@ class Box {
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
-        int retry_count = 0;
-    #ifdef LOCK_SEARCH
-    retry_read:
-        uint32_t start_version = version_lock_.load(std::memory_order_acquire);
-        if (start_version & WRITE_LOCK_BIT) {
-            exponential_backoff(retry_count++);
-            goto retry_read;
+        for (;;) {
+#ifdef LOCK_SEARCH_SPIN_LOCK
+            std::unique_lock<tas_lock> serial_read(lock_);
+#endif
+            const uint32_t start_version = version_lock_.load(std::memory_order_acquire);
+            if (start_version & WRITE_LOCK_BIT) { std::this_thread::yield(); continue; }
+            const size_t index = findKeyIndex(key);
+            ValueType result_value = ValueType(-1);
+            SearchStatus status = SearchStatus::NOT_FOUND;
+            if (index != maxKey) { result_value = kv_entries_[index].value; status = SearchStatus::SUCCESS; }
+            if (version_changed(start_version)) { std::this_thread::yield(); continue; }
+            return {status, result_value};
         }
-    #endif
-
-    #ifdef LOCK_SEARCH_SPIN_LOCK
-        lock_.lock();
-    #endif
-
-        size_t index = findKeyIndex(key);
-        ValueType result_value = -1;
-        SearchStatus status = SearchStatus::NOT_FOUND;
-
-        if (index != maxKey) {
-            result_value = values[index];
-            status = SearchStatus::SUCCESS;
-        }
-
-    #ifdef LOCK_SEARCH
-        if (start_version != version_lock_.load(std::memory_order_acquire)) {
-            exponential_backoff(retry_count++);
-            goto retry_read;
-        }
-    #endif
-    #ifdef LOCK_SEARCH_SPIN_LOCK
-        lock_.unlock();
-    #endif
-        return {status, result_value};
     }
 
     size_t getmaxSize() const {
@@ -610,7 +620,7 @@ class Box {
             goto retry_write;
         }
         
-        values[index] = new_value;
+        kv_entries_[index].value = new_value;
         uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
         version_lock_.store(new_version, std::memory_order_release);
         return {InsertStatus::SUCCESS, -1};
@@ -619,7 +629,7 @@ class Box {
     vector<pair<KeyType, ValueType>> getEntries() const {
         vector<pair<KeyType, ValueType>> entries;
         for (size_t i = 0; i < maxSize; i++) {
-            if (valid_flags[i]) entries.push_back({keys[i], values[i]});
+            if (valid_flags[i]) entries.push_back({kv_entries_[i].key, kv_entries_[i].value});
         }
         return entries;
     }
@@ -632,7 +642,7 @@ class Box {
 
     void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries, size_t start_pos) const {
         for (size_t i = 0; i < maxSize; i++) {
-            if (valid_flags[i]) (*entries)[start_pos++] = {keys[i], values[i]};
+            if (valid_flags[i]) (*entries)[start_pos++] = {kv_entries_[i].key, kv_entries_[i].value};
         }
     }
 };
@@ -641,28 +651,40 @@ ThreadLocalWaitTimingStats splitting_flag_wait_stats(84, "Segment splitting_flag
 ThreadLocalWaitTimingStats split_segment_total_stats(84, "Total splitSegment time");
 
 template <typename KeyType, typename ValueType>
-class Segment {
-private:
-    size_t box_key_range;
-    size_t num_threads;
-
-    mutable ThreadLocalCounter operation_counter_;
-    std::atomic_flag splitting_flag_ = ATOMIC_FLAG_INIT;
-
-    size_t logical_box_count;
-    size_t physical_box_count;
-
-    Box<KeyType, ValueType>* first_box_ptr;
-    size_t active_box_count;
-
+class alignas(64) Segment {
 public:
     KeyType lower_bound;
     KeyType upper_bound;
+private:
+    Box<KeyType, ValueType>* first_box_ptr;
+    size_t box_key_range;
+    // Read routing and write admission both use this first cache line.
+    mutable ThreadLocalCounter operation_counter_;
+public:
+    mutable std::atomic<bool> splitting_{false};
+    std::atomic<bool> is_splitting_{false};
+private:
+    size_t logical_box_count;
+    size_t physical_box_count;
+    size_t active_box_count;
+    size_t num_threads;
+    std::atomic_flag splitting_flag_ = ATOMIC_FLAG_INIT;
+    std::deque<tas_lock> logical_write_locks_;
+    class OperationGuard {
+        Segment* owner_;
+    public:
+        explicit OperationGuard(Segment& owner) : owner_(owner.enter() ? &owner : nullptr) {}
+        ~OperationGuard() { if (owner_) owner_->leave(); }
+        explicit operator bool() const { return owner_ != nullptr; }
+        OperationGuard(const OperationGuard&) = delete;
+        OperationGuard& operator=(const OperationGuard&) = delete;
+    };
+
+
+public:
     std::deque<std::atomic<uint8_t>> logical_box_write_positions;
     static constexpr size_t PHYSICAL_BOXES_PER_LOGICAL = 1 + overflowCapacity;
     int numBoxes; // 对外表示逻辑box数量
-    mutable std::atomic<bool> splitting_{false};
-    std::atomic<bool> is_splitting_{false};
 
     // 主构造函数
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
@@ -687,6 +709,7 @@ public:
             new (&first_box_ptr[i]) Box<KeyType, ValueType>();
         }
 
+        logical_write_locks_.resize(logical_box_count);
         logical_box_write_positions.resize(logical_box_count);
         for (size_t i = 0; i < logical_box_count; i++) {
             logical_box_write_positions[i].store(0, std::memory_order_relaxed);
@@ -705,6 +728,7 @@ public:
         active_box_count = logical_count;
         first_box_ptr = existing_boxes;
 
+        logical_write_locks_.resize(logical_box_count);
         logical_box_write_positions.resize(logical_box_count);
         for (size_t i = 0; i < logical_box_count; i++) {
             logical_box_write_positions[i].store(0, std::memory_order_relaxed);
@@ -715,16 +739,14 @@ public:
     Segment& operator=(const Segment&) = delete;
 
     Segment(Segment&& other) noexcept
-        : lower_bound(other.lower_bound),
-          upper_bound(other.upper_bound),
-          box_key_range(other.box_key_range),
-          logical_box_count(other.logical_box_count),
-          physical_box_count(other.physical_box_count),
-          numBoxes(other.numBoxes),
-          active_box_count(other.active_box_count),
+        : lower_bound(other.lower_bound), upper_bound(other.upper_bound),
+          first_box_ptr(other.first_box_ptr), box_key_range(other.box_key_range),
           operation_counter_(std::move(other.operation_counter_)),
-          first_box_ptr(other.first_box_ptr),
-          logical_box_write_positions(std::move(other.logical_box_write_positions)) {
+          logical_box_count(other.logical_box_count), physical_box_count(other.physical_box_count),
+          active_box_count(other.active_box_count), num_threads(other.num_threads),
+          logical_write_locks_(std::move(other.logical_write_locks_)),
+          logical_box_write_positions(std::move(other.logical_box_write_positions)),
+          numBoxes(other.numBoxes) {
         splitting_.store(other.splitting_.load());
     }
 
@@ -737,8 +759,10 @@ public:
             physical_box_count = other.physical_box_count;
             numBoxes = other.numBoxes;
             active_box_count = other.active_box_count;
+            num_threads = other.num_threads;
             operation_counter_ = std::move(other.operation_counter_);
             first_box_ptr = other.first_box_ptr;
+            logical_write_locks_ = std::move(other.logical_write_locks_);
             logical_box_write_positions = std::move(other.logical_box_write_positions);
             splitting_.store(other.splitting_.load());
         }
@@ -798,123 +822,83 @@ public:
     }
 
     InsertResult insertKeyValue(KeyType key, ValueType value) {
-        if (!enter()) {
-            return {InsertStatus::SPLIT, -1};
-        }
-        if (key < lower_bound || key >= upper_bound) {
-            leave();
-            return {InsertStatus::OUT_OF_RANGE, -1};
-        }
+        OperationGuard operation(*this);
+        if (!operation) return {InsertStatus::SPLIT, -1};
+        if (key < lower_bound || key >= upper_bound) return {InsertStatus::OUT_OF_RANGE, -1};
+        const size_t logical = getLogicalBoxIndex(key);
+        std::lock_guard<tas_lock> writer(logical_write_locks_[logical]);
+        uint8_t current = logical_box_write_positions[logical].load(std::memory_order_acquire);
+        if (current >= PHYSICAL_BOXES_PER_LOGICAL) current = PHYSICAL_BOXES_PER_LOGICAL - 1;
 
-        size_t logical_box_index = getLogicalBoxIndex(key);
-        uint8_t current_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
-
-        // First, check if the key already exists in any physical box
-        // If found, update the value instead of inserting
-        for (uint8_t pos = 0; pos <= current_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
-            size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
-            size_t index = (first_box_ptr + physical_box_index)->searchUpdateKey(key);
-            if (index != maxKey) {
-                InsertResult result = (first_box_ptr + physical_box_index)->updateValue(index, value);
-                if (result.status == InsertStatus::SUCCESS) {
-                    leave();
-                    return {InsertStatus::SUCCESS, static_cast<int>(logical_box_index)};
-                }
-                throw std::runtime_error("Unexpected update operation result");
+        // Earlier boxes can contain an existing key. Check them before using
+        // any hole, otherwise an overwrite could create a second physical copy.
+        for (uint8_t pos = 0; pos < current; ++pos) {
+            auto* box = first_box_ptr + getPhysicalBoxIndex(logical, pos);
+            const size_t slot = box->searchUpdateKey(key);
+            if (slot != maxKey) {
+                box->updateValue(slot, value);
+                return {InsertStatus::SUCCESS, static_cast<int>(logical)};
             }
         }
+        // One box lock performs the current-box lookup AND insert/overwrite.
+        auto* target = first_box_ptr + getPhysicalBoxIndex(logical, current);
+        auto result = target->insertKeyValue(key, value);
+        if (result.status == InsertStatus::SUCCESS)
+            return {InsertStatus::SUCCESS, static_cast<int>(logical)};
+        if (result.status != InsertStatus::FULL)
+            return {result.status, static_cast<int>(logical)};
 
-        // Key not found, try to insert into an available box
-        // Build a mask of boxes with empty slots
-        uint8_t insert_position = 0;
-        for (uint8_t pos = 0; pos <= current_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
-            size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
-            if ((first_box_ptr + physical_box_index)->hasEmptySlots()) {
-                insert_position |= (1 << pos);
-            }
+        // The current box is full; reuse holes in earlier boxes before growing.
+        for (uint8_t pos = 0; pos < current; ++pos) {
+            auto* box = first_box_ptr + getPhysicalBoxIndex(logical, pos);
+            result = box->insertKeyValue(key, value);
+            if (result.status == InsertStatus::SUCCESS)
+                return {InsertStatus::SUCCESS, static_cast<int>(logical)};
         }
-
-        // Try to insert into boxes with empty slots
-        uint8_t try_insert = 0;
-        while (insert_position > 0) {
-            if (insert_position & 1) {
-                size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, try_insert);
-                InsertResult result = (first_box_ptr + physical_box_index)->insertKeyValue(key, value);
-                if (result.status == InsertStatus::SUCCESS) {
-                    if (try_insert > logical_box_write_positions[logical_box_index].load(std::memory_order_acquire)) {
-                        logical_box_write_positions[logical_box_index].store(try_insert, std::memory_order_release);
-                    }
-                    leave();
-                    return {InsertStatus::SUCCESS, static_cast<int>(logical_box_index)};
-                }
-            }
-            insert_position >>= 1;
-            try_insert++;
-        }
-
-        // No empty slots found, try to expand to a new physical box
-        // current_position is already an index; incrementing the last valid
-        // index would write into the next logical bucket (or beyond allocation).
-        while (current_position + 1 < PHYSICAL_BOXES_PER_LOGICAL) {
-            uint8_t expected = current_position;
-            if (logical_box_write_positions[logical_box_index].compare_exchange_weak(
-                expected, current_position + 1,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-                current_position++;
-            } else {
-                current_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
-            }
-
-            size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, current_position);
-            InsertResult result = (first_box_ptr + physical_box_index)->insertKeyValue(key, value);
-
-            if (result.status == InsertStatus::SUCCESS) {
-                leave();
-                return {InsertStatus::SUCCESS, static_cast<int>(logical_box_index)};
-            }
-
-            if (result.status != InsertStatus::FULL) {
-                leave();
-                return {result.status, static_cast<int>(logical_box_index)};
-            }
-        }
-
-        leave();
-        return {InsertStatus::FULL, static_cast<int>(logical_box_index)};
+        if (current + 1 >= PHYSICAL_BOXES_PER_LOGICAL)
+            return {InsertStatus::FULL, static_cast<int>(logical)};
+        ++current;
+        logical_box_write_positions[logical].store(current, std::memory_order_release);
+        result = (first_box_ptr + getPhysicalBoxIndex(logical, current))->insertKeyValue(key, value);
+        return {result.status, static_cast<int>(logical)};
     }
 
     DeleteResult deleteKey(KeyType key) {
-        if (!enter()) {
+        OperationGuard operation(*this);
+        if (!operation) {
             return {DeleteStatus::SPLIT, false};
         }
         if (key < lower_bound || key >= upper_bound) {
-            leave();
             return {DeleteStatus::OUT_OF_RANGE, false};
         }
 
         size_t logical_box_index = getLogicalBoxIndex(key);
+        std::lock_guard<tas_lock> logical_writer(logical_write_locks_[logical_box_index]);
         uint8_t max_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
 
         for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
             size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
             DeleteResult result = (first_box_ptr + physical_box_index)->deleteKey(key);
             if (result.found) {
-                leave();
                 return {DeleteStatus::SUCCESS, true};
             }
         }
 
-        leave();
         return {DeleteStatus::NOT_FOUND, false};
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
+        if (key < lower_bound || key >= upper_bound)
+            return {SearchStatus::OUT_OF_RANGE, ValueType{}};
         size_t logical_box_index = getLogicalBoxIndex(key);
         uint8_t max_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
 
         for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
             size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
 
+#if defined(INDEX_PREFETCH_KV_LINES) && INDEX_PREFETCH_KV_LINES > 0
+            (first_box_ptr + physical_box_index)->prefetchForSearch();
+#endif
             SearchResult<KeyType, ValueType> result = (first_box_ptr + physical_box_index)->searchKey(key);
             if (result.status == SearchStatus::SUCCESS) {
                 return result;
@@ -1018,6 +1002,7 @@ public:
         active_box_count = new_logical_count;
         numBoxes = new_logical_count;
 
+        logical_write_locks_.resize(logical_box_count);
         logical_box_write_positions.resize(logical_box_count);
         for (size_t i = 0; i < logical_box_count; i++) {
             logical_box_write_positions[i].store(0, std::memory_order_relaxed);
