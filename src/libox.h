@@ -268,7 +268,7 @@ struct tas_lock {
         }
     }
 
-    void unlock() { lock_.store(false); }
+    void unlock() { lock_.store(false, std::memory_order_release); }
 };
 
 template <typename KeyType, typename ValueType>
