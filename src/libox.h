@@ -1144,18 +1144,17 @@ public:
         for (;;) {
             {
                 index_concurrency::QuiescenceGate::ReadGuard read(topology_gate_);
-                int32_t position = searchIndex(key);
-                if (position >= 0) {
-                    auto result = segments[position]->insertKeyValue(key, value);
+                auto* target=routeSegment(key);
+                if (target) {
+                    auto result = target->insertKeyValue(key, value);
                     if (result.status != InsertStatus::FULL) return result;
                 }
             }
             // No directory index or segment pointer survives the read-to-write
             // transition. Recheck the current directory under exclusive access.
             index_concurrency::QuiescenceGate::WriteGuard write(topology_gate_);
-            int32_t position = searchIndex(key);
-            if (position < 0) { growDirectory(key); continue; }
-            auto* segment = segments[position];
+            auto* segment=routeSegment(key);
+            if (!segment) { growDirectory(key); continue; }
             auto result = segment->insertKeyValue(key, value);
             if (result.status != InsertStatus::FULL) return result;
             if (!segment->try_mark_for_splitting())
@@ -1170,13 +1169,12 @@ public:
         int retry_count = 0;
 
     retry_delete:
-        int32_t seg_index = searchIndex(key);
-        if (seg_index < 0) {
+        auto* target_segment=routeSegment(key);
+        if (!target_segment) {
             return {DeleteStatus::OUT_OF_RANGE, false};
         }
 
-        DeleteResult ret = segments[seg_index]->deleteKey(key);
-        Segment<KeyType, ValueType>* target_segment = segments[seg_index];
+        DeleteResult ret = target_segment->deleteKey(key);
         if (ret.status == DeleteStatus::SPLIT || ret.status == DeleteStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
             target_segment->wait_for_split_completion();
@@ -1195,13 +1193,12 @@ public:
         int retry_count = 0;
 
     retry_search:
-        int32_t seg_index = searchIndex(key);
-        if (seg_index < 0) {
+        auto* target_segment=routeSegment(key);
+        if (!target_segment) {
             return {SearchStatus::OUT_OF_RANGE, ValueType{}};
         }
 
-        SearchResult<KeyType, ValueType> ret = segments[seg_index]->searchKey(key);
-        Segment<KeyType, ValueType>* target_segment = segments[seg_index];
+        SearchResult<KeyType, ValueType> ret = target_segment->searchKey(key);
         if (ret.status == SearchStatus::SPLIT || ret.status == SearchStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
             target_segment->wait_for_split_completion();
@@ -1252,6 +1249,8 @@ public:
 
         // Preserve spare aliases, but grow the directory when all replacements
         // cannot fit in the old segment's slots. Never discard split results.
+        const KeyType replaced_lower=new_segment_start_keys.front();
+        const KeyType replaced_upper=new_segments.back()->getUpperBound();
         const size_t old_slots = end_pos - start_pos + 1;
         while (new_segments.size() < old_slots) {
             new_segments.push_back(new_segments.back());
@@ -1264,7 +1263,7 @@ public:
         segment_start_keys.insert(segment_start_keys.begin() + start_pos,
                                   new_segment_start_keys.begin(), new_segment_start_keys.end());
 
-        buildSearchIndex();
+        updateSearchIndex(replaced_lower,replaced_upper);
     }
 
     void splitSegment(Segment<KeyType, ValueType>* segment_ptr, int box_index) {
@@ -1546,51 +1545,48 @@ public:
         segment_start_keys = std::move(new_start_keys);
     }
 
-    void buildSearchIndex() {
-        if (segment_start_keys.empty()) return;
-
-        int64_t redundantSize = segment_start_keys.size() * 90;
-        redundantArray.assign(redundantSize, -1);
-
-        size_t memory_bytes = redundantSize * sizeof(int32_t);
-        std::cout << "redundantArray size: " << redundantSize << " elements" << std::endl;
-        std::cout << "redundantArray memory: " << memory_bytes << " bytes ("
-                << (memory_bytes / 1024.0) << " KB, "
-                << (memory_bytes / 1024.0 / 1024.0) << " MB)" << std::endl;
-
-        a = static_cast<double>((redundantSize-1) /
-              (static_cast<long double>(segment_start_keys.back())-static_cast<long double>(segment_start_keys.front())));
-
-        for (size_t i = 0; i < segment_start_keys.size(); i++) {
-            int64_t position = static_cast<int64_t>(a * index_concurrency::range_width(segment_start_keys.front(),segment_start_keys[i]));
-            if (position >= 0 && position < redundantSize) {
-                redundantArray[position] = i;
-            }
-        }
-
-        int32_t lastValidIndex = 0;
-        for (size_t i = 0; i < redundantSize; i++) {
-            if (redundantArray[i] == -1) {
-                redundantArray[i] = lastValidIndex;
-            } else {
-                lastValidIndex = redundantArray[i];
-            }
-        }
-
+private:
+    size_t directoryCell(KeyType key) const {
+        const auto position=static_cast<int64_t>(a*index_concurrency::range_width(segment_start_keys.front(),key));
+        return static_cast<size_t>(std::clamp<int64_t>(position,0,redundantArray.size()-1));
     }
 
-    int32_t searchIndex(KeyType key) {
-        if (segment_start_keys.empty()) return BELOW_LOWER_BOUND;
-        if (key < segment_start_keys.front()) {
-            return BELOW_LOWER_BOUND;
-        } else if (key >= segment_start_keys.back()) {
-            return ABOVE_UPPER_BOUND;
+public:
+    void buildSearchIndex() {
+        if(segments.empty()){redundantArray.clear();return;}
+        const size_t size=segment_start_keys.size()*90;
+        redundantArray.assign(size,-1);
+        a=static_cast<double>((size-1)/(static_cast<long double>(segment_start_keys.back())-segment_start_keys.front()));
+        for(size_t i=0;i<segment_start_keys.size();++i)
+            redundantArray[directoryCell(segment_start_keys[i])]=static_cast<int32_t>(i);
+        int32_t last=0;
+        for(auto& entry:redundantArray){if(entry>=0)last=entry;else entry=last;}
+    }
+
+private:
+    void updateSearchIndex(KeyType lower,KeyType upper) {
+        // Preserve the original grid density. Rebuild when the directory grows;
+        // repair only the replaced interval when the directory length is stable.
+        // Directory-vector insertion can still move elements.
+        if(redundantArray.empty()||segment_start_keys.size()*90>redundantArray.size()){
+            buildSearchIndex();return;
         }
+        const size_t first=directoryCell(lower),last=directoryCell(upper);
+        int32_t current=first?redundantArray[first-1]:0;
+        auto it=std::lower_bound(segment_start_keys.begin(),segment_start_keys.end(),first,
+            [&](KeyType bound,size_t cell){return directoryCell(bound)<cell;});
+        size_t cursor=first;
+        while(it!=segment_start_keys.end()&&directoryCell(*it)<=last){
+            const size_t cell=directoryCell(*it);
+            std::fill(redundantArray.begin()+cursor,redundantArray.begin()+cell,current);
+            current=static_cast<int32_t>(it-segment_start_keys.begin());
+            cursor=cell;++it;
+        }
+        std::fill(redundantArray.begin()+cursor,redundantArray.begin()+last+1,current);
+    }
 
-        int64_t position = static_cast<int64_t>(a * index_concurrency::range_width(segment_start_keys.front(),key));
-        position=std::clamp<int64_t>(position,0,redundantArray.size()-1);
-        int32_t estimatedIndex = std::clamp<int32_t>(redundantArray[position],0,segments.size()-1);
-
+private:
+    int32_t correctIndex(KeyType key,int32_t estimatedIndex) {
         int32_t left_boundary = estimatedIndex;
         while (left_boundary > 0 &&
             segment_start_keys[left_boundary - 1] == segment_start_keys[estimatedIndex]) {
@@ -1691,6 +1687,29 @@ public:
         return -1;
     }
 
+public:
+    int32_t searchIndex(KeyType key) {
+        if(segment_start_keys.empty()||key<segment_start_keys.front())return BELOW_LOWER_BOUND;
+        if(key>=segment_start_keys.back())return ABOVE_UPPER_BOUND;
+        const int32_t estimated=std::clamp<int32_t>(redundantArray[directoryCell(key)],0,segments.size()-1);
+        return correctIndex(key,estimated);
+    }
+
+private:
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((always_inline))
+#endif
+    inline Segment<KeyType,ValueType>* routeSegment(KeyType key) {
+        if(segments.empty()||key<segment_start_keys.front()||key>=segment_start_keys.back())return nullptr;
+        const int32_t estimated=std::clamp<int32_t>(redundantArray[directoryCell(key)],0,segments.size()-1);
+        // Adjacent boundaries provide a cheap verified fast path. Duplicate
+        // aliases or an inaccurate cell retain the original correction logic.
+        if(segment_start_keys[estimated]<=key&&key<segment_start_keys[estimated+1])return segments[estimated];
+        const int32_t corrected=correctIndex(key,estimated);
+        return corrected>=0?segments[corrected]:nullptr;
+    }
+
+public:
     void loadConfigByFile(const string& config_file) {
         const auto ranges = index_concurrency::read_index_config<KeyType>(config_file);
         std::vector<std::unique_ptr<Segment<KeyType,ValueType>>> pending;

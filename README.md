@@ -2,6 +2,12 @@
 
 A concurrent, in-memory numerical index using an interpolation directory,
 range-organized segments and SIMD fingerprint filtering inside boxes.
+The interpolation table retains 4-byte segment indices. The common lookup path
+checks the indexed key interval before using the existing correction search.
+Same-size directory replacements
+repair only affected table cells; directory growth or outer-bound changes rebuild
+the grid at its original density. Vector insertion can still move directory entries.
+Table cells remain `int32_t`; the optimization does not enlarge the table.
 
 ## Requirements and build
 
