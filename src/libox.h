@@ -3,6 +3,7 @@
 #include <xmmintrin.h>
 
 #include "online_range.h"
+#include "index_config.h"
 #include "atomic_box.h"
 #include <algorithm>
 #include <array>
@@ -685,6 +686,10 @@ public:
     std::deque<std::atomic<uint8_t>> logical_box_write_positions;
     static constexpr size_t PHYSICAL_BOXES_PER_LOGICAL = 1 + overflowCapacity;
     int numBoxes; // 对外表示逻辑box数量
+private:
+    // Ownership is cold metadata: preserve existing routing/lock field offsets.
+    std::shared_ptr<Box<KeyType,ValueType>[]> box_storage_owner_;
+public:
 
     // 主构造函数
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
@@ -695,19 +700,27 @@ public:
         // bucket for exact multiples, later published as an empty split range.
         if (upper <= lower || box_range == 0)
             throw std::invalid_argument("Segment requires nonempty half-open bounds and positive bucket width");
-        size_t total = index_concurrency::range_width(lower, upper);
-        logical_box_count = total / box_range;
-        if (total % box_range != 0) logical_box_count++;
+        if constexpr (std::is_integral_v<KeyType>) {
+            const size_t total = index_concurrency::range_width(lower, upper);
+            logical_box_count = total / box_range + (total % box_range != 0);
+        } else {
+            const long double span = static_cast<long double>(upper) - static_cast<long double>(lower);
+            const long double count = std::ceil(span / box_range);
+            if (!std::isfinite(span) || !std::isfinite(count) || count < 1 || count > std::numeric_limits<int>::max())
+                throw std::invalid_argument("Segment floating range cannot be represented");
+            logical_box_count = static_cast<size_t>(count);
+        }
+        if (logical_box_count > std::numeric_limits<int>::max() ||
+            logical_box_count > std::numeric_limits<size_t>::max() / PHYSICAL_BOXES_PER_LOGICAL)
+            throw std::length_error("Segment has too many boxes");
 
         physical_box_count = logical_box_count * PHYSICAL_BOXES_PER_LOGICAL;
         numBoxes = logical_box_count;
         active_box_count = logical_box_count;
 
-        first_box_ptr = new Box<KeyType, ValueType>[physical_box_count];
-
-        for (size_t i = 0; i < physical_box_count; i++) {
-            new (&first_box_ptr[i]) Box<KeyType, ValueType>();
-        }
+        box_storage_owner_.reset(new Box<KeyType, ValueType>[physical_box_count],
+                                 std::default_delete<Box<KeyType,ValueType>[]>());
+        first_box_ptr = box_storage_owner_.get();
 
         logical_write_locks_.resize(logical_box_count);
         logical_box_write_positions.resize(logical_box_count);
@@ -718,7 +731,8 @@ public:
 
     // 用于split的构造函数
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num,
-            Box<KeyType, ValueType>* existing_boxes, size_t logical_count, bool take_ownership = false)
+            Box<KeyType, ValueType>* existing_boxes, size_t logical_count, bool take_ownership = false,
+            std::shared_ptr<Box<KeyType,ValueType>[]> storage_owner = {})
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
           operation_counter_(thread_num), num_threads(thread_num) {
 
@@ -727,6 +741,9 @@ public:
         numBoxes = logical_count;
         active_box_count = logical_count;
         first_box_ptr = existing_boxes;
+        box_storage_owner_ = std::move(storage_owner);
+        if (take_ownership && !box_storage_owner_)
+            box_storage_owner_.reset(existing_boxes, std::default_delete<Box<KeyType,ValueType>[]>());
 
         logical_write_locks_.resize(logical_box_count);
         logical_box_write_positions.resize(logical_box_count);
@@ -746,7 +763,7 @@ public:
           active_box_count(other.active_box_count), num_threads(other.num_threads),
           logical_write_locks_(std::move(other.logical_write_locks_)),
           logical_box_write_positions(std::move(other.logical_box_write_positions)),
-          numBoxes(other.numBoxes) {
+          numBoxes(other.numBoxes), box_storage_owner_(std::move(other.box_storage_owner_)) {
         splitting_.store(other.splitting_.load());
     }
 
@@ -760,6 +777,7 @@ public:
             numBoxes = other.numBoxes;
             active_box_count = other.active_box_count;
             num_threads = other.num_threads;
+            box_storage_owner_ = std::move(other.box_storage_owner_);
             operation_counter_ = std::move(other.operation_counter_);
             first_box_ptr = other.first_box_ptr;
             logical_write_locks_ = std::move(other.logical_write_locks_);
@@ -769,10 +787,17 @@ public:
         return *this;
     }
 
-    ~Segment() {}
+    ~Segment() = default;
+
+    const std::shared_ptr<Box<KeyType,ValueType>[]>& getBoxStorageOwner() const {
+        return box_storage_owner_;
+    }
 
     size_t getLogicalBoxIndex(KeyType key) const {
-        return index_concurrency::range_width(lower_bound, key) / box_key_range;
+        if constexpr (std::is_integral_v<KeyType>)
+            return index_concurrency::range_width(lower_bound, key) / box_key_range;
+        else
+            return std::min(static_cast<size_t>((static_cast<long double>(key) - lower_bound) / box_key_range), logical_box_count - 1);
     }
 
     size_t getPhysicalBoxIndex(size_t logical_box_index, uint8_t position_offset) const {
@@ -1368,7 +1393,7 @@ public:
 
                 right_segment = new Segment<KeyType, ValueType>(
                     right_lower, original_upper_bound, segment->getBoxKeyRange(), thread_num,
-                    right_boxes, right_logical_box_count
+                    right_boxes, right_logical_box_count, false, segment->getBoxStorageOwner()
                 );
 
                 for (size_t i = 0; i < right_logical_box_count; i++) {
@@ -1490,6 +1515,9 @@ public:
         auto split_end = std::chrono::high_resolution_clock::now();
         auto split_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(split_end - split_start).count();
         split_segment_total_stats.record_wait(split_duration);
+        // With no surviving side range, the directory no longer owns the old
+        // segment. All readers have drained under the topology write guard.
+        if (!has_left && !has_right) delete segment;
     }
 
     void insertEmptySlots(int empty_slots_between = 3) {
@@ -1664,50 +1692,19 @@ public:
     }
 
     void loadConfigByFile(const string& config_file) {
-        ifstream config(config_file);
-        if (!config.is_open()) {
-            throw runtime_error("Failed to open config file.");
+        const auto ranges = index_concurrency::read_index_config<KeyType>(config_file);
+        std::vector<std::unique_ptr<Segment<KeyType,ValueType>>> pending;
+        for (const auto& r : ranges)
+            pending.push_back(std::make_unique<Segment<KeyType,ValueType>>(r.lower,r.upper,r.width,thread_num));
+        // Configuration loading is an initialization operation, not concurrent.
+        std::set<Segment<KeyType,ValueType>*> previous(segments.begin(),segments.end());
+        segments.clear();segment_start_keys.clear();
+        for (auto& seg : pending) {
+            segments.push_back(seg.get());segment_start_keys.push_back(seg->getLowerBound());
+            seg.release();
         }
-
-        string line;
-        while (getline(config, line)) {
-            istringstream iss(line);
-            std::string token = "";
-            KeyType lower, upper;
-            size_t box_range;
-
-            if (getline(iss, token, ',')) {
-                if constexpr (std::is_same_v<KeyType, double>) {
-                    lower = std::stod(token);
-                } else if constexpr (std::is_signed_v<KeyType>) {
-                    lower = std::stoll(token);
-                } else {
-                    lower = std::stoull(token);
-                }
-            }
-            if (getline(iss, token, ',')) {
-                if constexpr (std::is_same_v<KeyType, double>) {
-                    upper = std::stod(token);
-                } else if constexpr (std::is_signed_v<KeyType>) {
-                    upper = std::stoll(token);
-                } else {
-                    upper = std::stoull(token);
-                }
-            }
-            if (getline(iss, token)) {
-                box_range = stoul(token);
-            }
-
-            auto* seg = new Segment<KeyType, ValueType>(lower, upper, box_range, thread_num);
-            segments.push_back(seg);
-            segment_start_keys.push_back(lower);
-        }
-
-        if (!segments.empty()) {
-            segment_start_keys.push_back(
-                segments.back()->getUpperBound());
-        }
-
+        if (!segments.empty())segment_start_keys.push_back(segments.back()->getUpperBound());
+        for(auto* seg:previous)delete seg;
         insertEmptySlots(emptySlots_between);
         buildSearchIndex();
     }
@@ -1720,11 +1717,14 @@ public:
         // Sort the data if not already sorted
         vector<KeyType> sorted_data = data;
         std::sort(sorted_data.begin(), sorted_data.end());
+        sorted_data.erase(std::unique(sorted_data.begin(),sorted_data.end()),sorted_data.end());
 
         // Use the same parameters as partition_optimization.cpp
         int max_look_ahead = 15;
         KeyType data_lower = sorted_data[0];
-        KeyType data_upper = sorted_data.back();
+        KeyType data_upper;
+        if constexpr(std::is_integral_v<KeyType>)data_upper=index_concurrency::first_range(sorted_data.back()).upper;
+        else data_upper=std::nextafter(sorted_data.back(),std::numeric_limits<KeyType>::infinity());
 
         // Calculate segments using the same algorithm
         std::vector<KeySegment<KeyType>> KeySegments =
@@ -1734,18 +1734,17 @@ public:
         // Convert to StructSegment
         std::vector<StructSegment<KeyType>> final_segments = toStructSegment(KeySegments);
 
-        // Create Segment objects
-        for (const auto& struct_seg : final_segments) {
-            auto* seg = new Segment<KeyType, ValueType>(
-                struct_seg.seg_lower,
-                struct_seg.seg_upper,
-                struct_seg.box_range,
-                thread_num
-            );
-            segments.push_back(seg);
-            segment_start_keys.push_back(struct_seg.seg_lower);
+        // Replace configuration rather than appending a second terminal bound.
+        std::vector<std::unique_ptr<Segment<KeyType,ValueType>>> pending;
+        for (const auto& r : final_segments)
+            pending.push_back(std::make_unique<Segment<KeyType,ValueType>>(r.seg_lower,r.seg_upper,r.box_range,thread_num));
+        std::set<Segment<KeyType,ValueType>*> previous(segments.begin(),segments.end());
+        segments.clear();segment_start_keys.clear();
+        for(auto* seg:previous)delete seg;
+        for (auto& owned : pending) {
+            auto* seg = owned.release();
+            segments.push_back(seg);segment_start_keys.push_back(seg->getLowerBound());
         }
-
         if (!segments.empty()) {
             segment_start_keys.push_back(
                 segments.back()->getUpperBound());

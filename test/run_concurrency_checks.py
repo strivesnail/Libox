@@ -15,7 +15,7 @@ build('test/segment_bounds_regression.cpp','bounds',['-DLIBOX'] if is_libox else
 build('test/segment_layout_regression.cpp','layout',['-DLIBOX'] if is_libox else [])
 # Small fanout is deliberate: exercise recursive inner splits, not just buckets.
 build('test/concurrent_split_regression.cpp','split',['-DLIBOX'] if is_libox else ['-DSPLIT_THRESHOLD=8'])
-env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',UBSAN_OPTIONS='halt_on_error=1',OMP_PROC_BIND='TRUE',OMP_DYNAMIC='FALSE')
+env=dict(os.environ,ASAN_OPTIONS='detect_leaks=1',UBSAN_OPTIONS='halt_on_error=1',OMP_PROC_BIND='TRUE',OMP_DYNAMIC='FALSE')
 cpus=sorted(os.sched_getaffinity(0));rows=[]
 def run(name,cmd,threads):
  current=dict(env,OMP_PLACES=','.join('{'+str(c)+'}' for c in cpus[:threads]))
